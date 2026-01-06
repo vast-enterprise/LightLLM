@@ -33,7 +33,6 @@ def test_decode_attentions(
     block_seq: int,
     q_shape: List[int],
     kv_shape: List[int],
-    max_batch_group_size: int,
     test_seq_len: int,
     dtype: torch.dtype,
     test_count: int = 20,
@@ -109,7 +108,7 @@ def test_decode_attentions(
             mid_out,
             mid_out_logsumexp,
             block_seq,
-            max_batch_group_size,
+            4,
         ), dict(run_config=run_config)
         args.append((arg_list, kwargs))
 
@@ -140,7 +139,6 @@ def worker(
     block_seq: int,
     q_shape: List[int],
     kv_shape: List[int],
-    max_batch_group_size: int,
     test_seq_len: int,
     dtype: torch.dtype,
     test_count: int,
@@ -157,7 +155,6 @@ def worker(
                 block_seq=block_seq,
                 q_shape=q_shape,
                 kv_shape=kv_shape,
-                max_batch_group_size=max_batch_group_size,
                 test_seq_len=test_seq_len,
                 dtype=dtype,
                 test_count=test_count,
@@ -217,7 +214,6 @@ def tuning_configs(
     block_seq: int,
     q_shape: List[int],
     kv_shape: List[int],
-    max_batch_group_size: int,
     test_seq_len: int,
     dtype: torch.dtype,
     test_count: int,
@@ -237,7 +233,6 @@ def tuning_configs(
                 block_seq,
                 q_shape,
                 kv_shape,
-                max_batch_group_size,
                 test_seq_len,
                 dtype,
                 test_count,
@@ -269,7 +264,6 @@ def tuning_configs(
                 block_seq,
                 q_shape,
                 kv_shape,
-                max_batch_group_size,
                 test_seq_len,
                 dtype,
                 test_count,
@@ -314,38 +308,34 @@ if __name__ == "__main__":
                 yield batch_size, seq_len
 
     for q_head_dim in [128]:
-        for max_batch_group_size in [4, 8]:
-            for gqa_group_size in [2, 4, 5, 8, 16]:
-                store_json_ans = collections.defaultdict(dict)
-                for batch_size, seq_len in config_iter():
-                    ans = mp_tuning(
-                        tuning_configs,
-                        {
-                            "block_seq": block_seq,
-                            "q_shape": [batch_size, gqa_group_size, q_head_dim],
-                            "kv_shape": [batch_size * seq_len, 1, q_head_dim],
-                            "max_batch_group_size": max_batch_group_size,
-                            "test_seq_len": seq_len,
-                            "dtype": torch.half,
-                            "test_count": 1,
-                        },
-                    )
-                    store_json_ans[seq_len][batch_size] = ans
+        for gqa_group_size in [2, 4, 5, 8, 16]:
+            store_json_ans = collections.defaultdict(dict)
+            for batch_size, seq_len in config_iter():
+                ans = mp_tuning(
+                    tuning_configs,
+                    {
+                        "block_seq": block_seq,
+                        "q_shape": [batch_size, gqa_group_size, q_head_dim],
+                        "kv_shape": [batch_size * seq_len, 1, q_head_dim],
+                        "test_seq_len": seq_len,
+                        "dtype": torch.half,
+                        "test_count": 1,
+                    },
+                )
+                store_json_ans[seq_len][batch_size] = ans
 
-                    GQADiverseDecodeStage1KernelConfig.save_config(
-                        gqa_group_size=gqa_group_size,
-                        max_batch_group_size=max_batch_group_size,
-                        q_head_dim=q_head_dim,
-                        block_seq=block_seq,
-                        out_dtype=str(torch.float16),
-                        config_json=store_json_ans,
-                    )
+                GQADiverseDecodeStage1KernelConfig.save_config(
+                    gqa_group_size=gqa_group_size,
+                    q_head_dim=q_head_dim,
+                    block_seq=block_seq,
+                    out_dtype=str(torch.float16),
+                    config_json=store_json_ans,
+                )
 
-                    GQADiverseDecodeStage1KernelConfig.save_config(
-                        gqa_group_size=gqa_group_size,
-                        max_batch_group_size=max_batch_group_size,
-                        q_head_dim=q_head_dim,
-                        block_seq=block_seq,
-                        out_dtype=str(torch.bfloat16),
-                        config_json=store_json_ans,
-                    )
+                GQADiverseDecodeStage1KernelConfig.save_config(
+                    gqa_group_size=gqa_group_size,
+                    q_head_dim=q_head_dim,
+                    block_seq=block_seq,
+                    out_dtype=str(torch.bfloat16),
+                    config_json=store_json_ans,
+                )
