@@ -138,7 +138,7 @@ async def async_post_stream_openai(url, prompt, max_new_tokens, session):
         last_time = start_time
         async with session.post(url, headers=headers, json=data) as response:
             if response.status != 200:
-                return []
+                return [], 0, 0
 
             async for line in response.content:
                 line = line.strip()
@@ -150,7 +150,7 @@ async def async_post_stream_openai(url, prompt, max_new_tokens, session):
             return used_time, input_len, len(used_time)
     except Exception as e:
         print(e)
-        pass
+        return [], 0, 0
 
 
 async def async_post_stream_lightllm(url, prompt, max_new_tokens, session):
@@ -171,7 +171,7 @@ async def async_post_stream_lightllm(url, prompt, max_new_tokens, session):
         last_time = start_time
         async with session.post(url, headers=headers, json=data) as response:
             if response.status != 200:
-                return []
+                return [], 0, 0
 
             async for line in response.content:
                 if line and line.startswith(b"data:"):
@@ -183,7 +183,7 @@ async def async_post_stream_lightllm(url, prompt, max_new_tokens, session):
         return used_time, input_len, len(used_time)
     except Exception as e:
         print(e)
-        pass
+        return [], 0, 0
 
 
 async def async_post_stream_openai_chat(url, prompt, max_new_tokens, session):
@@ -211,34 +211,38 @@ async def async_post_stream_openai_chat(url, prompt, max_new_tokens, session):
         async with session.post(url, headers=headers, json=data) as response:
             if response.status != 200:
                 error_text = await response.text()
-                print(f"\nError {response.status}: {error_text}")
-                return []
+                print(f"\nError {response.status}: {error_text[:500]}")
+                return [], 0, 0
 
-            async for line in response.content:
-                line = line.strip()
-                if line and line.startswith(b"data:"):
-                    data_str = line[5:].strip()  # Remove "data:" prefix
-                    if data_str == b"[DONE]":
-                        break
+            try:
+                async for line in response.content:
+                    line = line.strip()
+                    if line and line.startswith(b"data:"):
+                        data_str = line[5:].strip()  # Remove "data:" prefix
+                        if data_str == b"[DONE]":
+                            break
 
-                    try:
-                        chunk = json.loads(data_str.decode('utf-8'))
+                        try:
+                            chunk = json.loads(data_str.decode('utf-8'))
 
-                        # Extract usage info if available
-                        if "usage" in chunk:
-                            prompt_tokens = chunk["usage"].get("prompt_tokens", 0)
-                            completion_tokens = chunk["usage"].get("completion_tokens", 0)
+                            # Extract usage info if available
+                            if "usage" in chunk and chunk["usage"] is not None:
+                                prompt_tokens = chunk["usage"].get("prompt_tokens", 0)
+                                completion_tokens = chunk["usage"].get("completion_tokens", 0)
 
-                        # Track timing for each chunk with content
-                        if "choices" in chunk and len(chunk["choices"]) > 0:
-                            delta = chunk["choices"][0].get("delta", {})
-                            if "content" in delta and delta["content"]:
-                                current_time = time.time()
-                                elapsed_time = current_time - last_time
-                                used_time.append(elapsed_time)
-                                last_time = current_time
-                    except json.JSONDecodeError:
-                        continue
+                            # Track timing for each chunk with content
+                            if "choices" in chunk and len(chunk["choices"]) > 0:
+                                delta = chunk["choices"][0].get("delta", {})
+                                if "content" in delta and delta["content"]:
+                                    current_time = time.time()
+                                    elapsed_time = current_time - last_time
+                                    used_time.append(elapsed_time)
+                                    last_time = current_time
+                        except json.JSONDecodeError:
+                            continue
+            except Exception as stream_error:
+                print(f"\nStream reading error: {stream_error}")
+                # Continue to return what we have so far
 
         # Use real token counts if available, otherwise fall back to estimates
         real_input_len = prompt_tokens if prompt_tokens > 0 else 0
@@ -249,7 +253,7 @@ async def async_post_stream_openai_chat(url, prompt, max_new_tokens, session):
         print(f"\nException in async_post_stream_openai_chat: {e}")
         import traceback
         traceback.print_exc()
-        return []
+        return [], 0, 0
 
 
 async def continuous_sender(
