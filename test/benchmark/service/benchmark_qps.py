@@ -373,12 +373,13 @@ async def run_continuous_benchmark(
     end_time = [0.0]
     pending_tasks = []
 
-    # Increase timeout for multimodal requests (image processing can be slow)
+    # Set reasonable timeout for multimodal requests
+    # Short timeouts help identify issues quickly instead of hanging
     timeout = aiohttp.ClientTimeout(
-        total=None,  # No total timeout limit
-        connect=600,  # 连接超时10分钟
-        sock_connect=600,  # Socket连接超时10分钟
-        sock_read=600,  # 读取超时10分钟（关键：两次数据接收之间的最大间隔）
+        total=300,  # 总超时5分钟
+        connect=30,  # 连接超时30秒
+        sock_connect=30,  # Socket连接超时30秒
+        sock_read=120,  # 读取超时2分钟（如果超过说明服务器处理太慢）
     )
 
     # Create progress bar
@@ -471,6 +472,12 @@ def main():
         default=0,
         help="0: only send input_num reqs; 1: send continuously until receiving input_num reqs",
     )
+    parser.add_argument(
+        "--max_requests",
+        type=int,
+        default=None,
+        help="Limit the number of requests to send (useful for testing with subset of data). If not set, use all data.",
+    )
 
     args = parser.parse_args()
     if args.dump_file and os.path.exists(args.dump_file):
@@ -501,6 +508,13 @@ def main():
             prompts, max_new_tokens = get_custom_input_data_multimodal(args.data_path, args.output_len, args.range_ratio)
         else:
             prompts, max_new_tokens = get_custom_input_data(args.data_path, args.output_len, tokenizer, args.range_ratio)
+
+        # Apply max_requests limit if specified
+        if args.max_requests is not None and args.max_requests < len(prompts):
+            print(f"Limiting requests from {len(prompts)} to {args.max_requests}")
+            prompts = prompts[:args.max_requests]
+            max_new_tokens = max_new_tokens[:args.max_requests]
+
         args.input_num = len(prompts)
     else:
         # qps发送模式发送请求的数量不固定，这里暂定为input_num的10倍
