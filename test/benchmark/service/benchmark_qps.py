@@ -108,10 +108,14 @@ def get_custom_input_data_multimodal(data_path, output_len, range_ratio):
     """
     prompts = []
     with open(data_path, "r") as f:
-        for line in f.readlines():
-            data_line = json.loads(line)
-            # Keep original messages structure, don't process with tokenizer
-            prompts.append([data_line["messages"], 0])  # input_len=0, will be updated from response
+        lines = f.readlines()
+
+    print(f"Loading {len(lines)} multimodal samples...")
+    for line in tqdm(lines, desc="Loading data", unit="sample"):
+        data_line = json.loads(line)
+        # Keep original messages structure, don't process with tokenizer
+        prompts.append([data_line["messages"], 0])  # input_len=0, will be updated from response
+
     output_lens = get_random_length(len(prompts), output_len, range_ratio)
     print(f"Load multimodal data finish. Loaded {len(prompts)} samples.")
     return prompts, output_lens
@@ -298,6 +302,7 @@ async def response_collector(
     sent_count,
     force_terminate,
     pending_tasks,
+    pbar=None,
 ):
     try:
         while True:
@@ -310,15 +315,28 @@ async def response_collector(
                     results.append((result, input_len, output_len))
                 current_count = counter[0] + 1
                 counter[0] = current_count
-                print(f"\rfinished_reqs:{current_count} / target_reqs:{reqs_num} / sent_reqs:{sent_count[0]}", end="")
+
+                # Update progress bar if provided
+                if pbar:
+                    pbar.update(1)
+                    pbar.set_postfix({"sent": sent_count[0], "valid": len(results)})
+                else:
+                    print(f"\rfinished_reqs:{current_count} / target_reqs:{reqs_num} / sent_reqs:{sent_count[0]}", end="")
+
                 if len(results) >= reqs_num and not stop_send.is_set():
                     end_time[0] = time.time()
-                    print("\nReached target number of responses")
+                    if pbar:
+                        pbar.write("\nReached target number of responses")
+                    else:
+                        print("\nReached target number of responses")
                     stop_send.set()
                     if force_terminate and not stop_event.is_set():
                         stop_event.set()
                     else:
-                        print("\nWaiting remining responses to finish...")
+                        if pbar:
+                            pbar.write("Waiting remining responses to finish...")
+                        else:
+                            print("\nWaiting remining responses to finish...")
 
                 if current_count >= sent_count[0] and not stop_event.is_set():
                     stop_event.set()
@@ -331,7 +349,11 @@ async def response_collector(
                     return
                 continue
             except Exception as e:
-                print(f"\nError collecting response: {e}")
+                error_msg = f"\nError collecting response: {e}"
+                if pbar:
+                    pbar.write(error_msg)
+                else:
+                    print(error_msg)
     finally:
         if force_terminate:
             for task in pending_tasks:
@@ -357,6 +379,9 @@ async def run_continuous_benchmark(
         sock_connect=300,
         sock_read=3600,
     )
+
+    # Create progress bar
+    pbar = tqdm(total=reqs_num, desc="Benchmark Progress", unit="req")
 
     async with aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(limit=10 * reqs_num),
@@ -392,6 +417,7 @@ async def run_continuous_benchmark(
                     sent_count,
                     force_terminate,
                     pending_tasks,
+                    pbar,
                 )
             )
             for _ in range(num_clients)
@@ -405,6 +431,7 @@ async def run_continuous_benchmark(
             except asyncio.CancelledError:
                 pass
 
+    pbar.close()
     return results_data, sent_count[0], end_time[0]
 
 
