@@ -100,6 +100,23 @@ def get_custom_input_data(data_path, output_len, tokenizer, range_ratio):
     return prompts, output_lens
 
 
+def get_custom_input_data_multimodal(data_path, output_len, range_ratio):
+    """
+    Load multimodal data (with images) from JSONL file.
+    Keeps original messages structure for OpenAI Chat Completions API.
+    input_len will be obtained from API response.
+    """
+    prompts = []
+    with open(data_path, "r") as f:
+        for line in f.readlines():
+            data_line = json.loads(line)
+            # Keep original messages structure, don't process with tokenizer
+            prompts.append([data_line["messages"], 0])  # input_len=0, will be updated from response
+    output_lens = get_random_length(len(prompts), output_len, range_ratio)
+    print(f"Load multimodal data finish. Loaded {len(prompts)} samples.")
+    return prompts, output_lens
+
+
 model_name = []
 
 
@@ -130,7 +147,7 @@ async def async_post_stream_openai(url, prompt, max_new_tokens, session):
                     elapsed_time = current_time - last_time
                     used_time.append(elapsed_time)
                     last_time = current_time
-            return used_time, input_len
+            return used_time, input_len, len(used_time)
     except Exception as e:
         print(e)
         pass
@@ -163,10 +180,76 @@ async def async_post_stream_lightllm(url, prompt, max_new_tokens, session):
                     elapsed_time = current_time - last_time
                     used_time.append(elapsed_time)
                     last_time = current_time
-        return used_time, input_len
+        return used_time, input_len, len(used_time)
     except Exception as e:
         print(e)
         pass
+
+
+async def async_post_stream_openai_chat(url, prompt, max_new_tokens, session):
+    """
+    OpenAI Chat Completions API with multimodal support.
+    Supports streaming and extracts real token counts from usage info.
+    """
+    try:
+        messages, _ = prompt  # messages is the original multimodal content
+        data = {
+            "model": model_name[0],
+            "messages": messages,
+            "max_tokens": max_new_tokens,
+            "stream": True,
+            "temperature": 0.0,
+            "stream_options": {"include_usage": True}  # Request usage info in stream
+        }
+        headers = {"Content-Type": "application/json"}
+        used_time = []
+        start_time = time.time()
+        last_time = start_time
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        async with session.post(url, headers=headers, json=data) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                print(f"\nError {response.status}: {error_text}")
+                return []
+
+            async for line in response.content:
+                line = line.strip()
+                if line and line.startswith(b"data:"):
+                    data_str = line[5:].strip()  # Remove "data:" prefix
+                    if data_str == b"[DONE]":
+                        break
+
+                    try:
+                        chunk = json.loads(data_str.decode('utf-8'))
+
+                        # Extract usage info if available
+                        if "usage" in chunk:
+                            prompt_tokens = chunk["usage"].get("prompt_tokens", 0)
+                            completion_tokens = chunk["usage"].get("completion_tokens", 0)
+
+                        # Track timing for each chunk with content
+                        if "choices" in chunk and len(chunk["choices"]) > 0:
+                            delta = chunk["choices"][0].get("delta", {})
+                            if "content" in delta and delta["content"]:
+                                current_time = time.time()
+                                elapsed_time = current_time - last_time
+                                used_time.append(elapsed_time)
+                                last_time = current_time
+                    except json.JSONDecodeError:
+                        continue
+
+        # Use real token counts if available, otherwise fall back to estimates
+        real_input_len = prompt_tokens if prompt_tokens > 0 else 0
+        real_output_len = completion_tokens if completion_tokens > 0 else len(used_time)
+
+        return used_time, real_input_len, real_output_len
+    except Exception as e:
+        print(f"\nException in async_post_stream_openai_chat: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
 
 
 async def continuous_sender(
@@ -216,11 +299,11 @@ async def response_collector(
         while True:
             try:
                 task = await asyncio.wait_for(request_queue.get(), timeout=1.0)
-                result, input_len = await task
+                result, input_len, output_len = await task
                 request_queue.task_done()
                 assert result is not None
                 if len(result) >= 1 and not stop_send.is_set():
-                    results.append((result, input_len))
+                    results.append((result, input_len, output_len))
                 current_count = counter[0] + 1
                 counter[0] = current_count
                 print(f"\rfinished_reqs:{current_count} / target_reqs:{reqs_num} / sent_reqs:{sent_count[0]}", end="")
@@ -369,12 +452,28 @@ def main():
     model_name.append(args.tokenizer_path)
     seed_all(args.seed)
     url = args.url
-    tokenizer = get_tokenizer(args.tokenizer_path)
+
+    # Determine which API to use and whether it's multimodal
+    if args.server_api == "openai_vision":
+        async_post_stream = async_post_stream_openai_chat
+        is_multimodal = True
+        # For openai_vision mode, tokenizer is optional (only used for model name)
+        tokenizer = None
+    else:
+        is_multimodal = False
+        tokenizer = get_tokenizer(args.tokenizer_path)
+
+    # Load data based on mode
     if args.data_path is not None:
-        prompts, max_new_tokens = get_custom_input_data(args.data_path, args.output_len, tokenizer, args.range_ratio)
+        if is_multimodal:
+            prompts, max_new_tokens = get_custom_input_data_multimodal(args.data_path, args.output_len, args.range_ratio)
+        else:
+            prompts, max_new_tokens = get_custom_input_data(args.data_path, args.output_len, tokenizer, args.range_ratio)
         args.input_num = len(prompts)
     else:
         # qps发送模式发送请求的数量不固定，这里暂定为input_num的10倍
+        if is_multimodal:
+            raise Exception("openai_vision mode requires --data_path to be specified")
         prompts, max_new_tokens = gen_random_data(
             args.input_len,
             args.output_len,
@@ -386,12 +485,13 @@ def main():
         )
 
     percentiles = [25, 50, 75, 90, 95, 99, 100]
-    if args.server_api == "lightllm":
-        async_post_stream = async_post_stream_lightllm
-    elif args.server_api == "openai":
-        async_post_stream = async_post_stream_openai
-    else:
-        raise Exception(f"Not support {args.server_api} server_api.")
+    if not is_multimodal:
+        if args.server_api == "lightllm":
+            async_post_stream = async_post_stream_lightllm
+        elif args.server_api == "openai":
+            async_post_stream = async_post_stream_openai
+        else:
+            raise Exception(f"Not support {args.server_api} server_api.")
 
     dump_dict = {}
     dump_dict["backend"] = args.server_api
@@ -421,19 +521,19 @@ def main():
     final_output_lens = []
     valid_num = 0
     input_lens = []
-    for result, input_len in results:
+    for result, input_len, output_len in results:
         if len(result) > 1:  # 统计至少decode出两个token的数据
             first_token_time.append(result[0])
             decode_token_time.append(sum(result[1:]) / len(result[1:]))
             request_time.append(sum(result))
-            final_output_lens.append(len(result))
+            final_output_lens.append(output_len)  # Use real token count
             input_lens.append(input_len)
             valid_num += 1
         else:
             first_token_time.append(result[0])
             decode_token_time.append(0)  # no decode
             request_time.append(sum(result))
-            final_output_lens.append(len(result))
+            final_output_lens.append(output_len)  # Use real token count
             input_lens.append(input_len)
             valid_num += 1
 
