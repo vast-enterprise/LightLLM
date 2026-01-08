@@ -373,11 +373,12 @@ async def run_continuous_benchmark(
     end_time = [0.0]
     pending_tasks = []
 
+    # Increase timeout for multimodal requests (image processing can be slow)
     timeout = aiohttp.ClientTimeout(
-        total=3600,  # 总超时时间1小时
-        connect=300,  # 连接超时5分钟
-        sock_connect=300,
-        sock_read=3600,
+        total=None,  # No total timeout limit
+        connect=600,  # 连接超时10分钟
+        sock_connect=600,  # Socket连接超时10分钟
+        sock_read=600,  # 读取超时10分钟（关键：两次数据接收之间的最大间隔）
     )
 
     # Create progress bar
