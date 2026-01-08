@@ -310,16 +310,19 @@ async def response_collector(
                 task = await asyncio.wait_for(request_queue.get(), timeout=1.0)
                 result, input_len, output_len = await task
                 request_queue.task_done()
-                assert result is not None
-                if len(result) >= 1 and not stop_send.is_set():
-                    results.append((result, input_len, output_len))
+
+                # Always count the request, even if it failed
                 current_count = counter[0] + 1
                 counter[0] = current_count
+
+                # Only add to results if we got valid data
+                if result is not None and len(result) >= 1 and not stop_send.is_set():
+                    results.append((result, input_len, output_len))
 
                 # Update progress bar if provided
                 if pbar:
                     pbar.update(1)
-                    pbar.set_postfix({"sent": sent_count[0], "valid": len(results)})
+                    pbar.set_postfix({"sent": sent_count[0], "valid": len(results), "failed": current_count - len(results)})
                 else:
                     print(f"\rfinished_reqs:{current_count} / target_reqs:{reqs_num} / sent_reqs:{sent_count[0]}", end="")
 
@@ -560,7 +563,25 @@ def main():
         )
     )
     loop.close()
-    print(len(results))
+    print(f"\nTotal responses received: {len(results)}")
+
+    # Handle case where no valid responses were received
+    if len(results) == 0:
+        print("\n" + "="*80)
+        print("ERROR: All requests failed! No valid responses received.")
+        print("="*80)
+        print("\nPossible reasons:")
+        print("1. Server timeout - sock_read timeout (120s) is too short for image processing")
+        print("2. Server overload - too many concurrent requests or high QPS")
+        print("3. Server not responding - check if server is running and accessible")
+        print("4. Network issues - check connectivity to", url)
+        print("\nSuggestions:")
+        print("- Try with --max_requests 1 to test a single request")
+        print("- Reduce concurrency: --num_clients 1 --input_qps 0.5")
+        print("- Check server logs for errors")
+        print("- Test with curl manually to verify server is working")
+        return
+
     first_token_time = []
     decode_token_time = []
     request_time = []
