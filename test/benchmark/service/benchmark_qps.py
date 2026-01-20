@@ -201,9 +201,8 @@ async def async_post_stream_openai_chat(url, prompt, max_new_tokens, session):
             "model": model_name[0],
             "messages": messages,
             "max_tokens": max_new_tokens,
-            "stream": True,
+            "stream": False,
             "temperature": 0.0,
-            "stream_options": {"include_usage": True}  # Request usage info in stream
         }
         headers = {"Content-Type": "application/json"}
         used_time = []
@@ -219,34 +218,16 @@ async def async_post_stream_openai_chat(url, prompt, max_new_tokens, session):
                 return [], 0, 0
 
             try:
-                async for line in response.content:
-                    line = line.strip()
-                    if line and line.startswith(b"data:"):
-                        data_str = line[5:].strip()  # Remove "data:" prefix
-                        if data_str == b"[DONE]":
-                            break
+                resp_json = await response.json()
+                used_time.append(time.time() - start_time)
+                print(resp_json["choices"][0]["message"]["content"])
 
-                        try:
-                            chunk = json.loads(data_str.decode('utf-8'))
-
-                            # Extract usage info if available
-                            if "usage" in chunk and chunk["usage"] is not None:
-                                prompt_tokens = chunk["usage"].get("prompt_tokens", 0)
-                                completion_tokens = chunk["usage"].get("completion_tokens", 0)
-
-                            # Track timing for each chunk with content
-                            if "choices" in chunk and len(chunk["choices"]) > 0:
-                                delta = chunk["choices"][0].get("delta", {})
-                                if "content" in delta and delta["content"]:
-                                    current_time = time.time()
-                                    elapsed_time = current_time - last_time
-                                    used_time.append(elapsed_time)
-                                    last_time = current_time
-                        except json.JSONDecodeError:
-                            continue
-            except Exception as stream_error:
-                print(f"\nStream reading error: {stream_error}")
-                # Continue to return what we have so far
+                if "usage" in resp_json and resp_json["usage"] is not None:
+                    prompt_tokens = resp_json["usage"].get("prompt_tokens", 0)
+                    completion_tokens = resp_json["usage"].get("completion_tokens", 0)
+            except Exception as e:
+                print(f"\nResponse parsing error: {e}")
+                return [], 0, 0
 
         # Use real token counts if available, otherwise fall back to estimates
         real_input_len = prompt_tokens if prompt_tokens > 0 else 0
