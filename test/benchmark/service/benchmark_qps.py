@@ -573,17 +573,10 @@ def main():
         if len(result) > 1:  # 统计至少decode出两个token的数据
             first_token_time.append(result[0])
             decode_token_time.append(sum(result[1:]) / len(result[1:]))
-            request_time.append(sum(result))
-            final_output_lens.append(output_len)  # Use real token count
-            input_lens.append(input_len)
-            valid_num += 1
-        else:
-            first_token_time.append(result[0])
-            decode_token_time.append(0)  # no decode
-            request_time.append(sum(result))
-            final_output_lens.append(output_len)  # Use real token count
-            input_lens.append(input_len)
-            valid_num += 1
+        request_time.append(sum(result))
+        final_output_lens.append(output_len)  # Use real token count
+        input_lens.append(input_len)
+        valid_num += 1
 
     print(
         f"\n\nvalid num = {valid_num}; all data num = {len(results)}; valid ratio = {valid_num * 1.0 / len(results)}\n"
@@ -613,20 +606,23 @@ def main():
     dump_dict["request_time"] = request_time_dict
     print("-" * 10)
 
-    first_token_time_dict = {}
-    values = np.percentile(first_token_time, percentiles)
-    for percentile, value in zip(percentiles, values):
-        print(f"first_token_time  P{percentile}: {value:.6f}s")
-        first_token_time_dict[f"P{percentile}"] = value
-    dump_dict["first_token_time_dict"] = first_token_time_dict
-    print("-" * 10)
+    # 非流式模式下跳过 first_token_time 和 decode_token_time 统计
+    if len(first_token_time) > 0:
+        first_token_time_dict = {}
+        values = np.percentile(first_token_time, percentiles)
+        for percentile, value in zip(percentiles, values):
+            print(f"first_token_time  P{percentile}: {value:.6f}s")
+            first_token_time_dict[f"P{percentile}"] = value
+        dump_dict["first_token_time_dict"] = first_token_time_dict
+        print("-" * 10)
 
-    decode_token_time_dict = {}
-    values = np.percentile(decode_token_time, percentiles)
-    for percentile, value in zip(percentiles, values):
-        print(f"decode_token_time  P{percentile}: {value * 1000:.6f}ms")
-        decode_token_time_dict[f"P{percentile}"] = value * 1000
-    dump_dict["decode_token_time_dict"] = decode_token_time_dict
+    if len(decode_token_time) > 0:
+        decode_token_time_dict = {}
+        values = np.percentile(decode_token_time, percentiles)
+        for percentile, value in zip(percentiles, values):
+            print(f"decode_token_time  P{percentile}: {value * 1000:.6f}ms")
+            decode_token_time_dict[f"P{percentile}"] = value * 1000
+        dump_dict["decode_token_time_dict"] = decode_token_time_dict
     print(dump_dict)
 
     if args.dump_file:
