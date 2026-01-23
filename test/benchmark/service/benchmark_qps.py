@@ -100,6 +100,27 @@ def get_custom_input_data(data_path, output_len, tokenizer, range_ratio):
     return prompts, output_lens
 
 
+def get_custom_input_data_multimodal(data_path, output_len, range_ratio):
+    """
+    Load multimodal data (with images) from JSONL file.
+    Keeps original messages structure for OpenAI Chat Completions API.
+    input_len will be obtained from API response.
+    """
+    prompts = []
+    with open(data_path, "r") as f:
+        lines = f.readlines()
+
+    print(f"Loading {len(lines)} multimodal samples...")
+    for line in tqdm(lines, desc="Loading data", unit="sample"):
+        data_line = json.loads(line)
+        # Keep original messages structure, don't process with tokenizer
+        prompts.append([data_line["messages"], 0])  # input_len=0, will be updated from response
+
+    output_lens = get_random_length(len(prompts), output_len, range_ratio)
+    print(f"Load multimodal data finish. Loaded {len(prompts)} samples.")
+    return prompts, output_lens
+
+
 model_name = []
 
 
@@ -121,7 +142,7 @@ async def async_post_stream_openai(url, prompt, max_new_tokens, session):
         last_time = start_time
         async with session.post(url, headers=headers, json=data) as response:
             if response.status != 200:
-                return []
+                return [], 0, 0
 
             async for line in response.content:
                 line = line.strip()
@@ -130,10 +151,10 @@ async def async_post_stream_openai(url, prompt, max_new_tokens, session):
                     elapsed_time = current_time - last_time
                     used_time.append(elapsed_time)
                     last_time = current_time
-            return used_time, input_len
+            return used_time, input_len, len(used_time)
     except Exception as e:
         print(e)
-        pass
+        return [], 0, 0
 
 
 async def async_post_stream_lightllm(url, prompt, max_new_tokens, session):
@@ -154,7 +175,7 @@ async def async_post_stream_lightllm(url, prompt, max_new_tokens, session):
         last_time = start_time
         async with session.post(url, headers=headers, json=data) as response:
             if response.status != 200:
-                return []
+                return [], 0, 0
 
             async for line in response.content:
                 if line and line.startswith(b"data:"):
@@ -163,10 +184,61 @@ async def async_post_stream_lightllm(url, prompt, max_new_tokens, session):
                     elapsed_time = current_time - last_time
                     used_time.append(elapsed_time)
                     last_time = current_time
-        return used_time, input_len
+        return used_time, input_len, len(used_time)
     except Exception as e:
         print(e)
-        pass
+        return [], 0, 0
+
+
+async def async_post_stream_openai_chat(url, prompt, max_new_tokens, session):
+    """
+    OpenAI Chat Completions API with multimodal support.
+    Supports streaming and extracts real token counts from usage info.
+    """
+    try:
+        messages, _ = prompt  # messages is the original multimodal content
+        data = {
+            "model": model_name[0],
+            "messages": messages,
+            "max_tokens": max_new_tokens,
+            "stream": False,
+            "temperature": 0.0,
+        }
+        headers = {"Content-Type": "application/json"}
+        used_time = []
+        start_time = time.time()
+        last_time = start_time
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        async with session.post(url, headers=headers, json=data) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                print(f"\nError {response.status}: {error_text[:500]}")
+                return [], 0, 0
+
+            try:
+                resp_json = await response.json()
+                used_time.append(time.time() - start_time)
+                print(resp_json["choices"][0]["message"]["content"])
+
+                if "usage" in resp_json and resp_json["usage"] is not None:
+                    prompt_tokens = resp_json["usage"].get("prompt_tokens", 0)
+                    completion_tokens = resp_json["usage"].get("completion_tokens", 0)
+            except Exception as e:
+                print(f"\nResponse parsing error: {e}")
+                return [], 0, 0
+
+        # Use real token counts if available, otherwise fall back to estimates
+        real_input_len = prompt_tokens if prompt_tokens > 0 else 0
+        real_output_len = completion_tokens if completion_tokens > 0 else len(used_time)
+
+        return used_time, real_input_len, real_output_len
+    except Exception as e:
+        print(f"\nException in async_post_stream_openai_chat: {e}")
+        import traceback
+        traceback.print_exc()
+        return [], 0, 0
 
 
 async def continuous_sender(
@@ -211,27 +283,44 @@ async def response_collector(
     sent_count,
     force_terminate,
     pending_tasks,
+    pbar=None,
 ):
     try:
         while True:
             try:
                 task = await asyncio.wait_for(request_queue.get(), timeout=1.0)
-                result, input_len = await task
+                result, input_len, output_len = await task
                 request_queue.task_done()
-                assert result is not None
-                if len(result) >= 1 and not stop_send.is_set():
-                    results.append((result, input_len))
+
+                # Always count the request, even if it failed
                 current_count = counter[0] + 1
                 counter[0] = current_count
-                print(f"\rfinished_reqs:{current_count} / target_reqs:{reqs_num} / sent_reqs:{sent_count[0]}", end="")
+
+                # Only add to results if we got valid data
+                if result is not None and len(result) >= 1 and not stop_send.is_set():
+                    results.append((result, input_len, output_len))
+
+                # Update progress bar if provided
+                if pbar:
+                    pbar.update(1)
+                    pbar.set_postfix({"sent": sent_count[0], "valid": len(results), "failed": current_count - len(results)})
+                else:
+                    print(f"\rfinished_reqs:{current_count} / target_reqs:{reqs_num} / sent_reqs:{sent_count[0]}", end="")
+
                 if len(results) >= reqs_num and not stop_send.is_set():
                     end_time[0] = time.time()
-                    print("\nReached target number of responses")
+                    if pbar:
+                        pbar.write("\nReached target number of responses")
+                    else:
+                        print("\nReached target number of responses")
                     stop_send.set()
                     if force_terminate and not stop_event.is_set():
                         stop_event.set()
                     else:
-                        print("\nWaiting remining responses to finish...")
+                        if pbar:
+                            pbar.write("Waiting remining responses to finish...")
+                        else:
+                            print("\nWaiting remining responses to finish...")
 
                 if current_count >= sent_count[0] and not stop_event.is_set():
                     stop_event.set()
@@ -244,7 +333,11 @@ async def response_collector(
                     return
                 continue
             except Exception as e:
-                print(f"\nError collecting response: {e}")
+                error_msg = f"\nError collecting response: {e}"
+                if pbar:
+                    pbar.write(error_msg)
+                else:
+                    print(error_msg)
     finally:
         if force_terminate:
             for task in pending_tasks:
@@ -264,12 +357,17 @@ async def run_continuous_benchmark(
     end_time = [0.0]
     pending_tasks = []
 
+    # Set reasonable timeout for multimodal requests
+    # Short timeouts help identify issues quickly instead of hanging
     timeout = aiohttp.ClientTimeout(
-        total=3600,  # 总超时时间1小时
-        connect=300,  # 连接超时5分钟
-        sock_connect=300,
-        sock_read=3600,
+        total=300,  # 总超时5分钟
+        connect=30,  # 连接超时30秒
+        sock_connect=30,  # Socket连接超时30秒
+        sock_read=120,  # 读取超时2分钟（如果超过说明服务器处理太慢）
     )
+
+    # Create progress bar
+    pbar = tqdm(total=reqs_num, desc="Benchmark Progress", unit="req")
 
     async with aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(limit=10 * reqs_num),
@@ -305,6 +403,7 @@ async def run_continuous_benchmark(
                     sent_count,
                     force_terminate,
                     pending_tasks,
+                    pbar,
                 )
             )
             for _ in range(num_clients)
@@ -318,6 +417,7 @@ async def run_continuous_benchmark(
             except asyncio.CancelledError:
                 pass
 
+    pbar.close()
     return results_data, sent_count[0], end_time[0]
 
 
@@ -356,6 +456,12 @@ def main():
         default=0,
         help="0: only send input_num reqs; 1: send continuously until receiving input_num reqs",
     )
+    parser.add_argument(
+        "--max_requests",
+        type=int,
+        default=None,
+        help="Limit the number of requests to send (useful for testing with subset of data). If not set, use all data.",
+    )
 
     args = parser.parse_args()
     if args.dump_file and os.path.exists(args.dump_file):
@@ -369,12 +475,35 @@ def main():
     model_name.append(args.tokenizer_path)
     seed_all(args.seed)
     url = args.url
-    tokenizer = get_tokenizer(args.tokenizer_path)
+
+    # Determine which API to use and whether it's multimodal
+    if args.server_api == "openai_vision":
+        async_post_stream = async_post_stream_openai_chat
+        is_multimodal = True
+        # For openai_vision mode, tokenizer is optional (only used for model name)
+        tokenizer = None
+    else:
+        is_multimodal = False
+        tokenizer = get_tokenizer(args.tokenizer_path)
+
+    # Load data based on mode
     if args.data_path is not None:
-        prompts, max_new_tokens = get_custom_input_data(args.data_path, args.output_len, tokenizer, args.range_ratio)
+        if is_multimodal:
+            prompts, max_new_tokens = get_custom_input_data_multimodal(args.data_path, args.output_len, args.range_ratio)
+        else:
+            prompts, max_new_tokens = get_custom_input_data(args.data_path, args.output_len, tokenizer, args.range_ratio)
+
+        # Apply max_requests limit if specified
+        if args.max_requests is not None and args.max_requests < len(prompts):
+            print(f"Limiting requests from {len(prompts)} to {args.max_requests}")
+            prompts = prompts[:args.max_requests]
+            max_new_tokens = max_new_tokens[:args.max_requests]
+
         args.input_num = len(prompts)
     else:
         # qps发送模式发送请求的数量不固定，这里暂定为input_num的10倍
+        if is_multimodal:
+            raise Exception("openai_vision mode requires --data_path to be specified")
         prompts, max_new_tokens = gen_random_data(
             args.input_len,
             args.output_len,
@@ -386,12 +515,13 @@ def main():
         )
 
     percentiles = [25, 50, 75, 90, 95, 99, 100]
-    if args.server_api == "lightllm":
-        async_post_stream = async_post_stream_lightllm
-    elif args.server_api == "openai":
-        async_post_stream = async_post_stream_openai
-    else:
-        raise Exception(f"Not support {args.server_api} server_api.")
+    if not is_multimodal:
+        if args.server_api == "lightllm":
+            async_post_stream = async_post_stream_lightllm
+        elif args.server_api == "openai":
+            async_post_stream = async_post_stream_openai
+        else:
+            raise Exception(f"Not support {args.server_api} server_api.")
 
     dump_dict = {}
     dump_dict["backend"] = args.server_api
@@ -414,28 +544,39 @@ def main():
         )
     )
     loop.close()
-    print(len(results))
+    print(f"\nTotal responses received: {len(results)}")
+
+    # Handle case where no valid responses were received
+    if len(results) == 0:
+        print("\n" + "="*80)
+        print("ERROR: All requests failed! No valid responses received.")
+        print("="*80)
+        print("\nPossible reasons:")
+        print("1. Server timeout - sock_read timeout (120s) is too short for image processing")
+        print("2. Server overload - too many concurrent requests or high QPS")
+        print("3. Server not responding - check if server is running and accessible")
+        print("4. Network issues - check connectivity to", url)
+        print("\nSuggestions:")
+        print("- Try with --max_requests 1 to test a single request")
+        print("- Reduce concurrency: --num_clients 1 --input_qps 0.5")
+        print("- Check server logs for errors")
+        print("- Test with curl manually to verify server is working")
+        return
+
     first_token_time = []
     decode_token_time = []
     request_time = []
     final_output_lens = []
     valid_num = 0
     input_lens = []
-    for result, input_len in results:
+    for result, input_len, output_len in results:
         if len(result) > 1:  # 统计至少decode出两个token的数据
             first_token_time.append(result[0])
             decode_token_time.append(sum(result[1:]) / len(result[1:]))
-            request_time.append(sum(result))
-            final_output_lens.append(len(result))
-            input_lens.append(input_len)
-            valid_num += 1
-        else:
-            first_token_time.append(result[0])
-            decode_token_time.append(0)  # no decode
-            request_time.append(sum(result))
-            final_output_lens.append(len(result))
-            input_lens.append(input_len)
-            valid_num += 1
+        request_time.append(sum(result))
+        final_output_lens.append(output_len)  # Use real token count
+        input_lens.append(input_len)
+        valid_num += 1
 
     print(
         f"\n\nvalid num = {valid_num}; all data num = {len(results)}; valid ratio = {valid_num * 1.0 / len(results)}\n"
@@ -465,20 +606,23 @@ def main():
     dump_dict["request_time"] = request_time_dict
     print("-" * 10)
 
-    first_token_time_dict = {}
-    values = np.percentile(first_token_time, percentiles)
-    for percentile, value in zip(percentiles, values):
-        print(f"first_token_time  P{percentile}: {value:.6f}s")
-        first_token_time_dict[f"P{percentile}"] = value
-    dump_dict["first_token_time_dict"] = first_token_time_dict
-    print("-" * 10)
+    # 非流式模式下跳过 first_token_time 和 decode_token_time 统计
+    if len(first_token_time) > 0:
+        first_token_time_dict = {}
+        values = np.percentile(first_token_time, percentiles)
+        for percentile, value in zip(percentiles, values):
+            print(f"first_token_time  P{percentile}: {value:.6f}s")
+            first_token_time_dict[f"P{percentile}"] = value
+        dump_dict["first_token_time_dict"] = first_token_time_dict
+        print("-" * 10)
 
-    decode_token_time_dict = {}
-    values = np.percentile(decode_token_time, percentiles)
-    for percentile, value in zip(percentiles, values):
-        print(f"decode_token_time  P{percentile}: {value * 1000:.6f}ms")
-        decode_token_time_dict[f"P{percentile}"] = value * 1000
-    dump_dict["decode_token_time_dict"] = decode_token_time_dict
+    if len(decode_token_time) > 0:
+        decode_token_time_dict = {}
+        values = np.percentile(decode_token_time, percentiles)
+        for percentile, value in zip(percentiles, values):
+            print(f"decode_token_time  P{percentile}: {value * 1000:.6f}ms")
+            decode_token_time_dict[f"P{percentile}"] = value * 1000
+        dump_dict["decode_token_time_dict"] = decode_token_time_dict
     print(dump_dict)
 
     if args.dump_file:
