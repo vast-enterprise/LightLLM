@@ -31,8 +31,7 @@ DeepSeek-R1
     python -m lightllm.server.api_server \
         --model_dir /path/to/DeepSeek-R1 \
         --reasoning_parser deepseek-r1 \
-        --tp 8 \
-        --enable_fa3
+        --tp 8
 
 DeepSeek-V3
 ~~~~~~~~~~~
